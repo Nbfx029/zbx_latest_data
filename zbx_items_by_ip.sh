@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# zbx_items_by_ip.sh - 指定IPの機器の監視アイテム最新データを一覧表示
+#
+# 事前設定: export ZBX_URL="https://.../api_jsonrpc.php" ZBX_USER="..." ZBX_PASS="..."
+# 使い方  : ./zbx_items_by_ip.sh 192.168.1.1 192.168.1.2  または  -f iplist.txt
+#
+set -eu
+set -o pipefail
+
+# ---------- 設定 ----------
+ZBX_URL="${ZBX_URL:-}"
+ZBX_USER="${ZBX_USER:-}"
+ZBX_PASS="${ZBX_PASS:-}"
+
+IP_FILE=""
+declare -a IPS=()
+
+# ---------- 引数処理 ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--file)
+      IP_FILE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      IPS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$IP_FILE" ]; then
+  if [ ! -r "$IP_FILE" ]; then
+    echo "エラー: ファイル '${IP_FILE}' が読み込めません。" >&2
+    exit 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+    IPS+=("$line")
+  done < "$IP_FILE"
+fi
+
+if [ -z "$ZBX_URL" ]; then
+  echo "エラー: ZBX_URL が設定されていません(例: export ZBX_URL=\"https://zabbix.example.com/api_jsonrpc.php\")" >&2
+  exit 1
+fi
+
+if [ "${#IPS[@]}" -eq 0 ]; then
+  echo "エラー: 対象IPアドレスを指定してください(引数か -f ファイルで渡してください)。" >&2
+  exit 1
+fi
+
+command -v jq >/dev/null 2>&1 || { echo "エラー: jq が必要です(sudo apt install jq 等でインストールしてください)" >&2; exit 1; }
+
+# IPの重複を除去(順序は維持)
+mapfile -t IPS < <(printf '%s\n' "${IPS[@]}" | awk '!seen[$0]++')
+
+# ---------- Zabbix API 呼び出し関数 ----------
+# $1: method, $2: params(JSON), $3: auth有無("with_auth"/"no_auth")
+zbx_call() {
+  local method="$1"
+  local params="$2"
+  local use_auth="$3"
+  local auth_field=""
+  local headers=(-H "Content-Type: application/json-rpc")
+
+  if [ "$use_auth" = "with_auth" ] && [ -n "${AUTH_ID:-}" ]; then
+    auth_field="\"auth\": \"${AUTH_ID}\","
+  fi
+
+  curl -s "${headers[@]}" -X POST "$ZBX_URL" \
+    -d "{\"jsonrpc\": \"2.0\", \"method\": \"${method}\", ${auth_field} \"params\": ${params}, \"id\": 1}"
+}
+
+# ---------- 認証 ----------
+if [ -z "$ZBX_USER" ] || [ -z "$ZBX_PASS" ]; then
+  echo "エラー: ZBX_USER / ZBX_PASS を設定してください。" >&2
+  exit 1
+fi
+echo "user.login で認証中..." >&2
+LOGIN_RES=$(zbx_call "user.login" "{\"username\": \"${ZBX_USER}\", \"password\": \"${ZBX_PASS}\"}" "no_auth")
+AUTH_ID=$(echo "$LOGIN_RES" | jq -r '.result // empty')
+if [ -z "$AUTH_ID" ]; then
+  echo "認証に失敗しました。レスポンス:" >&2
+  echo "$LOGIN_RES" | jq . >&2
+  exit 1
+fi
+
+# ---------- 対象ホストの解決 ----------
+# HOSTS_LIST の各要素は "hostid\x1fホスト名\x1fIP" の形式(表示順を維持するための配列)
+declare -a HOSTS_LIST=()
+declare -a NOT_FOUND_IPS=()
+
+# 指定したIPアドレスから、hostinterface.get でホストを解決する(IPの入力順を維持)
+IP_JSON_ARRAY=$(printf '%s\n' "${IPS[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+IFACE_RES=$(zbx_call "hostinterface.get" "{\"output\": [\"interfaceid\", \"hostid\", \"ip\"], \"selectHosts\": [\"hostid\", \"name\"], \"filter\": {\"ip\": ${IP_JSON_ARRAY}}}" "with_auth")
+
+ERROR_MSG=$(echo "$IFACE_RES" | jq -r '.error.data // empty')
+if [ -n "$ERROR_MSG" ]; then
+  echo "エラー: hostinterface.get 呼び出しに失敗しました: ${ERROR_MSG}" >&2
+  exit 1
+fi
+
+# 入力順を維持したまま "IP\x1fhostid\x1f名前\x1fFOUND/NOTFOUND" を1行ずつ出力させる
+RESOLVED=$(echo "$IFACE_RES" | jq -r --argjson ips "$IP_JSON_ARRAY" '
+  (.result // []) as $iface
+  | ([$iface[] | select((.hosts // []) | length > 0) | {(.ip): {hostid: .hosts[0].hostid, name: .hosts[0].name}}] | add // {}) as $map
+  | $ips[]
+  | . as $ip
+  | if ($map[$ip] != null) then
+      [$ip, $map[$ip].hostid, $map[$ip].name, "FOUND"] | join("\u001f")
+    else
+      [$ip, "", "", "NOTFOUND"] | join("\u001f")
+    end
+')
+
+while IFS=$'\x1f' read -r ip hostid name found; do
+  if [ "$found" = "FOUND" ]; then
+    HOSTS_LIST+=("${hostid}"$'\x1f'"${name}"$'\x1f'"${ip}")
+  else
+    NOT_FOUND_IPS+=("$ip")
+  fi
+done <<< "$RESOLVED"
+
+if [ "${#HOSTS_LIST[@]}" -eq 0 ]; then
+  echo "エラー: 該当するホストが1台も見つかりませんでした。" >&2
+  exit 1
+fi
+
+echo "対象ホスト数: ${#HOSTS_LIST[@]} 台" >&2
+if [ "${#NOT_FOUND_IPS[@]}" -gt 0 ]; then
+  echo "警告: Zabbixに未登録、または一致するホストが見つからなかったIP(${#NOT_FOUND_IPS[@]}件): ${NOT_FOUND_IPS[*]}" >&2
+fi
+
+# item.get 用の hostids 配列(重複除去)
+HOSTIDS=$(printf '%s\n' "${HOSTS_LIST[@]}" | awk -F'\x1f' '{print $1}' | jq -R -s -c 'split("\n") | map(select(length > 0)) | unique')
+
+# ---------- item.get: 監視アイテムの最新データ取得 ----------
+# state: 0=正常に値取得中 / 1=取得エラー(Not supported)
+# lastclock: 最終取得日時(unixtime)。"0"や空はまだ一度も値が入っていない(未取得)
+ITEM_PARAMS="{\"output\": [\"itemid\", \"name\", \"key_\", \"lastvalue\", \"lastclock\", \"units\", \"status\", \"state\"], \"selectHosts\": [\"hostid\"], \"hostids\": ${HOSTIDS}, \"sortfield\": \"name\", \"filter\": {\"status\": 0}}"
+ITEM_RES=$(zbx_call "item.get" "$ITEM_PARAMS" "with_auth")
+
+ERROR_MSG=$(echo "$ITEM_RES" | jq -r '.error.data // empty')
+if [ -n "$ERROR_MSG" ]; then
+  echo "エラー: item.get 呼び出しに失敗しました: ${ERROR_MSG}" >&2
+  exit 1
+fi
+
+# ---------- ログアウト(user.login方式のみ) ----------
+if [ -n "$AUTH_ID" ]; then
+  zbx_call "user.logout" "{}" "with_auth" >/dev/null 2>&1 || true
+fi
+
+# ---------- hostid ごとにアイテム行を振り分ける ----------
+# 区切り文字は \x1f (Unit Separator) を使う(bashのreadはタブだと空欄フィールド連続時に詰めてズレるため)。
+declare -A ITEMS_BY_HOST=()
+
+while IFS=$'\x1f' read -r hostid name key state lastclock lastvalue units; do
+  if [ "$lastclock" != "0" ] && [ -n "$lastclock" ]; then
+    ts=$(date -d "@${lastclock}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "${lastclock}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$lastclock")
+  else
+    ts="-"
+  fi
+
+  if [ -n "$lastvalue" ]; then
+    if [ -n "$units" ]; then valstr="${lastvalue} ${units}"; else valstr="${lastvalue}"; fi
+  else
+    valstr="-"
+  fi
+
+  if [ "$state" = "1" ]; then
+    status="NG"
+  elif [ "$lastclock" = "0" ] || [ -z "$lastclock" ]; then
+    status="未取得"
+  else
+    status="OK"
+  fi
+
+  row="${name}\t${key}\t${status}\t${ts}\t${valstr}"
+  ITEMS_BY_HOST["$hostid"]+="${row}"$'\n'
+done < <(echo "$ITEM_RES" | jq -r '
+  .result[]
+  | [
+      (.hosts[0].hostid),
+      .name,
+      .key_,
+      (.state // "0"),
+      (.lastclock // "0"),
+      ((.lastvalue // "") | gsub("[\t\n\r\u001f]"; " ")),
+      (.units // "")
+    ]
+  | join("\u001f")
+')
+
+# ---------- 機器ごとに区切って表示 ----------
+TOTAL=${#HOSTS_LIST[@]}
+IDX=0
+
+for entry in "${HOSTS_LIST[@]}"; do
+  IDX=$((IDX + 1))
+  IFS=$'\x1f' read -r hostid name ip <<< "$entry"
+
+  echo "============================================================"
+  printf "[%3d/%3d] %-15s %s\n" "$IDX" "$TOTAL" "$ip" "$name"
+  echo "============================================================"
+
+  body="${ITEMS_BY_HOST[$hostid]:-}"
+  if [ -z "$body" ]; then
+    echo "(有効な監視アイテムがありません)"
+  else
+    { echo -e "アイテム名\tキー\t状態\t最終更新日時\t最新値"; printf '%b' "$body"; } | column -t -s $'\t'
+  fi
+  echo ""
+done
