@@ -141,28 +141,6 @@ if [ "${#IPS[@]}" -gt 0 ]; then
     fi
   done <<< "$RESOLVED"
 
-elif [ -n "$HOSTGROUP" ]; then
-  # ホストグループ指定時はグループ内の全ホスト+IPを取得(名前順)
-  GROUP_RES=$(zbx_call "hostgroup.get" "{\"output\": [\"groupid\", \"name\"], \"filter\": {\"name\": [\"${HOSTGROUP}\"]}}" "with_auth")
-  GROUPID=$(echo "$GROUP_RES" | jq -r '.result[0].groupid // empty')
-  if [ -z "$GROUPID" ]; then
-    echo "エラー: ホストグループ '${HOSTGROUP}' が見つかりません。" >&2
-    exit 1
-  fi
-  HOST_RES=$(zbx_call "host.get" "{\"output\": [\"hostid\", \"name\"], \"selectInterfaces\": [\"ip\", \"main\"], \"groupids\": [\"${GROUPID}\"], \"sortfield\": \"name\"}" "with_auth")
-
-  while IFS=$'\x1f' read -r hostid name ip; do
-    HOSTS_LIST+=("${hostid}"$'\x1f'"${name}"$'\x1f'"${ip}")
-  done < <(echo "$HOST_RES" | jq -r '
-    .result[]
-    | (((.interfaces // []) | map(select(.main == "1"))) as $main
-       | if ($main | length) > 0 then $main[0].ip
-         elif ((.interfaces // []) | length) > 0 then .interfaces[0].ip
-         else "-" end) as $ip
-    | [.hostid, .name, $ip] | join("\u001f")
-  ')
-fi
-
 if [ "${#HOSTS_LIST[@]}" -eq 0 ]; then
   echo "エラー: 該当するホストが1台も見つかりませんでした。" >&2
   exit 1
