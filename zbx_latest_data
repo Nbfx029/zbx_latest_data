@@ -1,3 +1,5 @@
+cat > zbx_latest_data.sh << 'SCRIPT_EOF'
+
 set -eu
 set -o pipefail
 
@@ -252,3 +254,4 @@ for entry in "${HOSTS_LIST[@]}"; do
   fi
   echo ""
 done
+SCRIPT_EOF
